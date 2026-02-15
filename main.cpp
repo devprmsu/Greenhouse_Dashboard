@@ -1,114 +1,132 @@
-#include <Arduino.h>
 #include <WiFi.h>
-#include <Firebase_ESP_Client.h>
-#include <DHT.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include "DHT.h"
 
+// --- WiFi Credentials ---
+#define WIFI_SSID "Net101"
+#define WIFI_PASSWORD "1234567899"
 
-// --- CONFIGURATION ---
-//#define WIFI_SSID "YOUR_WIFI_NAME"
-//#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-#define API_KEY "AIzaSyD-gYivB1ye0UYiCKMSimVNaJm8dwWVHsE"
-#define DATABASE_URL "https://greenmind-5f7f3-default-rtdb.firebaseio.com"
+// --- Firebase REST Setup ---
+#define FIREBASE_HOST "greenmind-5f7f3-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "AIzaSyD-gYivB1ye0UYiCKMSimVNaJm8dwWVHsE"
 
-// --- HARDWARE PINS ---
-#define DHTPIN 4           // DHT22 Data Pin
+// --- Pin Mapping ---
+#define WIFI_LED 2 
+#define SOIL_PIN 34
+#define DHTPIN 5      // DHT22 on GPIO 5
 #define DHTTYPE DHT22
-#define SOIL_PIN 34        // Analog Soil Moisture Pin
-#define PUMP_PIN 26        // Relay 1
-#define MIST_PIN 27        // Relay 2
-#define FAN_PIN 14         // Relay 3
+#define FAN_PIN  12 
+#define MIST_PIN 13 
+#define PUMP_PIN 14 
 
+// Initialize DHT
 DHT dht(DHTPIN, DHTTYPE);
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
 
-unsigned long sendDataPrevMillis = 0;
-bool signupOK = false;
-
-// --- DATABASE CALLBACK ---
-// This function triggers whenever you flip a switch on the Web Dashboard
-void streamCallback(FirebaseStream data) {
-  String path = data.dataPath();
-  bool value = data.boolData();
-
-  if (path == "/pump") digitalWrite(PUMP_PIN, value ? LOW : HIGH); // LOW is usually ON for many relay modules
-  if (path == "/mist") digitalWrite(MIST_PIN, value ? LOW : HIGH);
-  if (path == "/fan")  digitalWrite(FAN_PIN, value ? LOW : HIGH);
-  
-  Serial.printf("Command Received: %s set to %d\n", path.c_str(), value);
-}
-
-void streamTimeoutCallback(bool timeout) {
-  if (timeout) Serial.println("Stream timed out, resuming...");
-}
+unsigned long lastUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
-
-  // Initialize Pins
-  pinMode(PUMP_PIN, OUTPUT);
-  pinMode(MIST_PIN, OUTPUT);
+  
+  // Pin Modes
+  pinMode(WIFI_LED, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
-  // Set relays to OFF initially
-  digitalWrite(PUMP_PIN, HIGH); 
-  digitalWrite(MIST_PIN, HIGH);
+  pinMode(MIST_PIN, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  
+  // Initialize Relays (OFF = HIGH)
   digitalWrite(FAN_PIN, HIGH);
+  digitalWrite(MIST_PIN, HIGH);
+  digitalWrite(PUMP_PIN, HIGH);
 
+  // Start DHT22
   dht.begin();
 
-  // WiFi Setup
+  // Connect WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(300); Serial.print(".");
+    digitalWrite(WIFI_LED, !digitalRead(WIFI_LED));
+    delay(500);
+    Serial.print(".");
   }
-  Serial.println("\nConnected to WiFi");
-
-  // Firebase Setup
-  config.api_key = API_KEY;
-  config.database_url = DATABASE_URL;
-
-  if (Firebase.signUp(&config, &auth, "", "")) {
-    signupOK = true;
-  }
-
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-
-  // Start listening for dashboard commands
-  if (!Firebase.RTDB.beginStream(&fbdo, "/greenhouse")) {
-    Serial.printf("Stream begin error, %s\n", fbdo.errorReason().c_str());
-  }
-  Firebase.RTDB.setStreamCallback(&fbdo, streamCallback, streamTimeoutCallback);
+  digitalWrite(WIFI_LED, HIGH);
+  Serial.println("\nSystem Online");
 }
 
 void loop() {
-  // Update sensors every 5 seconds
-  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 5000 || sendDataPrevMillis == 0)) {
-    sendDataPrevMillis = millis();
+  // Sync with Firebase every 5 seconds
+  if (millis() - lastUpdate > 5000) {
+    lastUpdate = millis();
+    syncWithFirebase();
+  }
+}
+
+void syncWithFirebase() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Bypass SSL check
+    HTTPClient http;
+
+    // 1. READ ACTUAL SENSORS
+    int rawSoil = analogRead(SOIL_PIN);
+    int soilPercent = map(rawSoil, 4095, 1500, 0, 100);
+    soilPercent = constrain(soilPercent, 0, 100);
 
     float h = dht.readHumidity();
     float t = dht.readTemperature();
-    int soilRaw = analogRead(SOIL_PIN);
-    int soilPercent = map(soilRaw, 4095, 1200, 0, 100); // Calibrate based on your sensor
-    if (soilPercent > 100) soilPercent = 100;
-    if (soilPercent < 0) soilPercent = 0;
 
+    // Verify DHT data
     if (isnan(h) || isnan(t)) {
-      Serial.println("Failed to read from DHT sensor!");
-      return;
+      Serial.println("DHT22 Error: Failed to read from sensor!");
+      // We still continue to send Soil data even if DHT fails
+      t = 0; 
+      h = 0;
     }
 
-    // Push data to Firebase
-    FirebaseJson json;
-    json.set("temp", t);
-    json.set("hum", h);
-    json.set("soil", soilPercent);
+    // 2. SEND SENSOR DATA (PATCH)
+    String url = "https://" + String(FIREBASE_HOST) + "/greenhouse.json?auth=" + String(FIREBASE_AUTH);
+    
+    StaticJsonDocument<200> doc;
+    doc["soil"] = soilPercent;
+    doc["temp"] = t;
+    doc["hum"] = h;
 
-    if (Firebase.RTDB.updateNode(&fbdo, "/greenhouse", &json)) {
-      Serial.println("Dashboard Updated Successfully");
+    String jsonPayload;
+    serializeJson(doc, jsonPayload);
+
+    http.begin(client, url);
+    int httpResponseCode = http.PATCH(jsonPayload); 
+
+    if (httpResponseCode > 0) {
+      Serial.printf("Update Success [%d]: T:%.1f H:%.1f S:%d%%\n", httpResponseCode, t, h, soilPercent);
     } else {
-      Serial.println("Update Failed: " + fbdo.errorReason());
+      Serial.println("Error sending data: " + String(httpResponseCode));
     }
+    http.end();
+
+    // 3. GET CONTROL STATES (GET)
+    http.begin(client, url);
+    int getCode = http.GET();
+
+    if (getCode == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<500> controlDoc;
+      deserializeJson(controlDoc, payload);
+
+      // Read states from your GitHub Dashboard
+      bool fanState = controlDoc["fan"];
+      bool mistState = controlDoc["mist"];
+      bool pumpState = controlDoc["pump"];
+
+      // Control Relays (Active Low logic: LOW = ON)
+      digitalWrite(FAN_PIN, fanState ? LOW : HIGH);
+      digitalWrite(MIST_PIN, mistState ? LOW : HIGH);
+      digitalWrite(PUMP_PIN, pumpState ? LOW : HIGH);
+      
+      Serial.println("Relay states synchronized.");
+    }
+    http.end();
   }
 }
